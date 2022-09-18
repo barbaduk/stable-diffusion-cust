@@ -313,247 +313,250 @@ del sd
 
 all_lines = False
 while True:
-    if opt.infile_loop is not None:
-        if not os.path.exists(opt.infile_loop):
-            all_lines = False
-            while not os.path.os.path.isfile(opt.infile_loop):
-                time.sleep(0.5)
-        if not all_lines:
-            prompt_file = open(opt.infile_loop, 'r', encoding='utf-8')
-            all_lines = prompt_file.readlines()
-            prompt_file.close()
-        command = all_lines.pop(0)
-        
-        try:
-            elements = shlex.split(command)
-        except ValueError as e:
-            print(str(e))
-            continue
+    try:
+        if opt.infile_loop is not None:
+            if not os.path.exists(opt.infile_loop):
+                all_lines = False
+                while not os.path.os.path.isfile(opt.infile_loop):
+                    time.sleep(0.5)
+            if not all_lines:
+                prompt_file = open(opt.infile_loop, 'r', encoding='utf-8')
+                all_lines = prompt_file.readlines()
+                prompt_file.close()
+            command = all_lines.pop(0)
 
-        switches = ['']
-        switches_started = False
-        
-        for el in elements:
-            if el[0] == '-' and not switches_started:
-                switches_started = True
-            if switches_started:
-                switches.append(el)
+            try:
+                elements = shlex.split(command)
+            except ValueError as e:
+                print(str(e))
+                continue
+
+            switches = ['']
+            switches_started = False
+
+            for el in elements:
+                if el[0] == '-' and not switches_started:
+                    switches_started = True
+                if switches_started:
+                    switches.append(el)
+                else:
+                    switches[0] += '--prompt'
+                    switches.append(el)
+            try:
+                switches.remove('')
+            except ValueError:
+                print('No empty elements')
+
+            try:
+                opt_loop = parser.parse_args(switches)
+            except SystemExit:
+                parser.print_help()
+                continue
+            if len(opt_loop.prompt) == 0:
+                print('Try again with a prompt!')
+                continue
+            batch_size = opt.n_samples
+            data = [batch_size * [opt_loop.prompt]]
+            opt.ddim_steps = opt_loop.ddim_steps
+            opt.scale = opt_loop.scale
+            opt.H = opt_loop.H
+            opt.W = opt_loop.W
+            if opt_loop.seed == None:
+                opt_loop.seed = randint(0, 1000000)
+            seed_everything(opt_loop.seed)
+            opt.seed = opt_loop.seed
+            if opt_loop.upscale:
+                opt.upscale = opt_loop.upscale
             else:
-                switches[0] += '--prompt'
-                switches.append(el)
-        try:
-            switches.remove('')
-        except ValueError:
-            print('No empty elements')
+                opt.upscale = None
+            if opt_loop.gfpgan_strength:
+                opt.gfpgan_strength = opt_loop.gfpgan_strength
+            else:
+                opt.gfpgan_strength = 0.0
 
-        try:
-            opt_loop = parser.parse_args(switches)
-        except SystemExit:
-            parser.print_help()
-            continue
-        if len(opt_loop.prompt) == 0:
-            print('Try again with a prompt!')
-            continue
-        batch_size = opt.n_samples
-        data = [batch_size * [opt_loop.prompt]]
-        opt.ddim_steps = opt_loop.ddim_steps
-        opt.scale = opt_loop.scale
-        opt.H = opt_loop.H
-        opt.W = opt_loop.W
-        if opt_loop.seed == None:
-            opt_loop.seed = randint(0, 1000000)
-        seed_everything(opt_loop.seed)
-        opt.seed = opt_loop.seed
-        if opt_loop.upscale:
-            opt.upscale = opt_loop.upscale
+            if opt_loop.init_img:
+                assert os.path.isfile(opt_loop.init_img)
+                init_image = load_img(opt_loop.init_img, opt.H, opt.W).to(opt.device)
+
         else:
-            opt.upscale = None
-        if opt_loop.gfpgan_strength:
-            opt.gfpgan_strength = opt_loop.gfpgan_strength
-        else:
-            opt.gfpgan_strength = 0.0
+            batch_size = opt.n_samples
+            n_rows = opt.n_rows if opt.n_rows > 0 else batch_size
+            if not opt.from_file:
+                assert opt.prompt is not None
+                prompt = opt.prompt
+                data = [batch_size * [prompt]]
+            else:
+                print(f"reading prompts from {opt.from_file}")
+                with open(opt.from_file, "r") as f:
+                    data = f.read().splitlines()
+                    data = batch_size * list(data)
+                    data = list(chunk(sorted(data), batch_size))
 
         if opt_loop.init_img:
-            assert os.path.isfile(opt_loop.init_img)
-            init_image = load_img(opt_loop.init_img, opt.H, opt.W).to(opt.device)
+            modelFS.to(opt.device)
 
-    else:
-        batch_size = opt.n_samples
-        n_rows = opt.n_rows if opt.n_rows > 0 else batch_size
-        if not opt.from_file:
-            assert opt.prompt is not None
-            prompt = opt.prompt
-            data = [batch_size * [prompt]]
+            init_image = repeat(init_image, "1 ... -> b ...", b=batch_size)
+            init_latent = modelFS.get_first_stage_encoding(modelFS.encode_first_stage(init_image))  # move to latent space
+
+            if opt.device != "cpu":
+                mem = torch.cuda.memory_allocated() / 1e6
+                modelFS.to("cpu")
+                while torch.cuda.memory_allocated() / 1e6 >= mem:
+                    time.sleep(1)
+
+
+            assert 0.0 <= opt_loop.strength <= 1.0, "can only work with strength in [0.0, 1.0]"
+            t_enc = int(opt_loop.strength * opt.ddim_steps)
+            print(f"target t_enc is {t_enc} steps")     
+        if opt.device != "cpu" and opt.precision == "autocast":
+            model.half()
+            modelCS.half()
+            if opt_loop.init_img:
+                modelFS.half()
+                init_image = init_image.half()
+
+        start_code = None
+        if opt.fixed_code:
+            start_code = torch.randn([opt.n_samples, opt.C, opt.H // opt.f, opt.W // opt.f], device=opt.device)
+
+        if opt.precision == "autocast" and opt.device != "cpu":
+            precision_scope = autocast
         else:
-            print(f"reading prompts from {opt.from_file}")
-            with open(opt.from_file, "r") as f:
-                data = f.read().splitlines()
-                data = batch_size * list(data)
-                data = list(chunk(sorted(data), batch_size))
+            precision_scope = nullcontext
 
-    if opt_loop.init_img:
-        modelFS.to(opt.device)
+        seeds = ""
+        with torch.no_grad():
 
-        init_image = repeat(init_image, "1 ... -> b ...", b=batch_size)
-        init_latent = modelFS.get_first_stage_encoding(modelFS.encode_first_stage(init_image))  # move to latent space
+            all_samples = list()
+            for n in trange(opt.n_iter, desc="Sampling"):
+                for prompts in tqdm(data, desc="data"):
 
-        if opt.device != "cpu":
-            mem = torch.cuda.memory_allocated() / 1e6
-            modelFS.to("cpu")
-            while torch.cuda.memory_allocated() / 1e6 >= mem:
-                time.sleep(1)
+                    sample_path = outpath
+                    os.makedirs(sample_path, exist_ok=True)
+                    base_count = len(os.listdir(sample_path))
 
+                    with precision_scope("cuda"):
+                        modelCS.to(opt.device)
+                        uc = None
+                        if opt.scale != 1.0:
+                            uc = modelCS.get_learned_conditioning(batch_size * [""])
+                        if isinstance(prompts, tuple):
+                            prompts = list(prompts)
 
-        assert 0.0 <= opt_loop.strength <= 1.0, "can only work with strength in [0.0, 1.0]"
-        t_enc = int(opt_loop.strength * opt.ddim_steps)
-        print(f"target t_enc is {t_enc} steps")     
-    if opt.device != "cpu" and opt.precision == "autocast":
-        model.half()
-        modelCS.half()
-        if opt_loop.init_img:
-            modelFS.half()
-            init_image = init_image.half()
+                        subprompts, weights = split_weighted_subprompts(prompts[0])
+                        if len(subprompts) > 1:
+                            c = torch.zeros_like(uc)
+                            totalWeight = sum(weights)
+                            # normalize each "sub prompt" and add it
+                            for i in range(len(subprompts)):
+                                weight = weights[i]
+                                # if not skip_normalize:
+                                weight = weight / totalWeight
+                                c = torch.add(c, modelCS.get_learned_conditioning(subprompts[i]), alpha=weight)
+                        else:
+                            c = modelCS.get_learned_conditioning(prompts)
 
-    start_code = None
-    if opt.fixed_code:
-        start_code = torch.randn([opt.n_samples, opt.C, opt.H // opt.f, opt.W // opt.f], device=opt.device)
+                        shape = [opt.n_samples, opt.C, opt.H // opt.f, opt.W // opt.f]
 
-    if opt.precision == "autocast" and opt.device != "cpu":
-        precision_scope = autocast
-    else:
-        precision_scope = nullcontext
-
-    seeds = ""
-    with torch.no_grad():
-
-        all_samples = list()
-        for n in trange(opt.n_iter, desc="Sampling"):
-            for prompts in tqdm(data, desc="data"):
-
-                sample_path = outpath
-                os.makedirs(sample_path, exist_ok=True)
-                base_count = len(os.listdir(sample_path))
-
-                with precision_scope("cuda"):
-                    modelCS.to(opt.device)
-                    uc = None
-                    if opt.scale != 1.0:
-                        uc = modelCS.get_learned_conditioning(batch_size * [""])
-                    if isinstance(prompts, tuple):
-                        prompts = list(prompts)
-
-                    subprompts, weights = split_weighted_subprompts(prompts[0])
-                    if len(subprompts) > 1:
-                        c = torch.zeros_like(uc)
-                        totalWeight = sum(weights)
-                        # normalize each "sub prompt" and add it
-                        for i in range(len(subprompts)):
-                            weight = weights[i]
-                            # if not skip_normalize:
-                            weight = weight / totalWeight
-                            c = torch.add(c, modelCS.get_learned_conditioning(subprompts[i]), alpha=weight)
-                    else:
-                        c = modelCS.get_learned_conditioning(prompts)
-
-                    shape = [opt.n_samples, opt.C, opt.H // opt.f, opt.W // opt.f]
-
-                    if opt.device != "cpu":
-                        mem = torch.cuda.memory_allocated() / 1e6
-                        modelCS.to("cpu")
-                        while torch.cuda.memory_allocated() / 1e6 >= mem:
-                            time.sleep(1)
-                    if opt_loop.init_img:
-                        # encode (scaled latent)
-                        z_enc = model.stochastic_encode(
-                            init_latent,
-                            torch.tensor([t_enc] * batch_size).to(opt.device),
-                            opt.seed,
-                            opt.ddim_eta,
-                            opt.ddim_steps,
-                        )
-                        # decode it
-                        samples_ddim = model.sample(
-                            t_enc,
-                            c,
-                            z_enc,
-                            unconditional_guidance_scale=opt.scale,
-                            unconditional_conditioning=uc,
-                            sampler = opt.sampler
-                        )
-                    else:
-                        try:
+                        if opt.device != "cpu":
+                            mem = torch.cuda.memory_allocated() / 1e6
+                            modelCS.to("cpu")
+                            while torch.cuda.memory_allocated() / 1e6 >= mem:
+                                time.sleep(1)
+                        if opt_loop.init_img:
+                            # encode (scaled latent)
+                            z_enc = model.stochastic_encode(
+                                init_latent,
+                                torch.tensor([t_enc] * batch_size).to(opt.device),
+                                opt.seed,
+                                opt.ddim_eta,
+                                opt.ddim_steps,
+                            )
+                            # decode it
                             samples_ddim = model.sample(
-                                S=opt.ddim_steps,
-                                conditioning=c,
-                                seed=opt.seed,
-                                shape=shape,
-                                verbose=False,
+                                t_enc,
+                                c,
+                                z_enc,
                                 unconditional_guidance_scale=opt.scale,
                                 unconditional_conditioning=uc,
-                                eta=opt.ddim_eta,
-                                x_T=start_code,
-                                sampler = opt.sampler,
-                            )
-                        except KeyboardInterrupt:
-                            print('**Interrupted** Partial results will be returned.')
-                            continue
-
-                    modelFS.to(opt.device)
-                    print("saving images")
-                    for i in range(batch_size):
-                    
-                        x_samples_ddim = modelFS.decode_first_stage(samples_ddim[i].unsqueeze(0))
-                        x_sample = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
-                        x_sample = 255.0 * rearrange(x_sample[0].cpu().numpy(), "c h w -> h w c")
-                        info = PngImagePlugin.PngInfo()
-                        info_text = f""""{prompts[0]}" -s{opt.ddim_steps} -W{opt.W} -H{opt.H} -C{opt.scale} -A{opt.sampler} -S{opt.seed}"""
-                        if opt_loop.init_img:
-                            info_text += f' -I"{opt_loop.init_img}"'
-                        if opt.upscale is not None or opt.gfpgan_strength > 0:
-                            if opt.upscale is not None:
-                                info_text += f' -U{opt.upscale[0]}'
-                            if opt.gfpgan_strength > 0:
-                                info_text += f' -G{opt.gfpgan_strength}'
-                            info.add_text('Dream', info_text)
-                            upscale_and_reconstruct(
-                                opt.seed,
-                                Image.fromarray(x_sample.astype(np.uint8)),
-                                opt.upscale,
-                                opt.gfpgan_strength
-                            ).save(
-                                os.path.join(sample_path, f"{base_count:05}.{opt.format}"), pnginfo=info
+                                sampler = opt.sampler
                             )
                         else:
-                            info.add_text('Dream', info_text)
-                            Image.fromarray(x_sample.astype(np.uint8)).save(
-                                os.path.join(sample_path, f"{base_count:05}.{opt.format}"), pnginfo=info
-                            )
-                        seeds += str(opt.seed) + ","
-                        opt.seed += 1
-                        base_count += 1
+                            try:
+                                samples_ddim = model.sample(
+                                    S=opt.ddim_steps,
+                                    conditioning=c,
+                                    seed=opt.seed,
+                                    shape=shape,
+                                    verbose=False,
+                                    unconditional_guidance_scale=opt.scale,
+                                    unconditional_conditioning=uc,
+                                    eta=opt.ddim_eta,
+                                    x_T=start_code,
+                                    sampler = opt.sampler,
+                                )
+                            except KeyboardInterrupt:
+                                print('**Interrupted** Partial results will be returned.')
+                                continue
 
-                    if opt.device != "cpu":
-                        mem = torch.cuda.memory_allocated() / 1e6
-                        modelFS.to("cpu")
-                        while torch.cuda.memory_allocated() / 1e6 >= mem:
-                            time.sleep(1)
-                    del samples_ddim
-                    print("memory_final = ", torch.cuda.memory_allocated() / 1e6)
+                        modelFS.to(opt.device)
+                        print("saving images")
+                        for i in range(batch_size):
 
-    toc = time.time()
+                            x_samples_ddim = modelFS.decode_first_stage(samples_ddim[i].unsqueeze(0))
+                            x_sample = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
+                            x_sample = 255.0 * rearrange(x_sample[0].cpu().numpy(), "c h w -> h w c")
+                            info = PngImagePlugin.PngInfo()
+                            info_text = f""""{prompts[0]}" -s{opt.ddim_steps} -W{opt.W} -H{opt.H} -C{opt.scale} -A{opt.sampler} -S{opt.seed}"""
+                            if opt_loop.init_img:
+                                info_text += f' -I"{opt_loop.init_img}"'
+                            if opt.upscale is not None or opt.gfpgan_strength > 0:
+                                if opt.upscale is not None:
+                                    info_text += f' -U{opt.upscale[0]}'
+                                if opt.gfpgan_strength > 0:
+                                    info_text += f' -G{opt.gfpgan_strength}'
+                                info.add_text('Dream', info_text)
+                                upscale_and_reconstruct(
+                                    opt.seed,
+                                    Image.fromarray(x_sample.astype(np.uint8)),
+                                    opt.upscale,
+                                    opt.gfpgan_strength
+                                ).save(
+                                    os.path.join(sample_path, f"{base_count:05}.{opt.format}"), pnginfo=info
+                                )
+                            else:
+                                info.add_text('Dream', info_text)
+                                Image.fromarray(x_sample.astype(np.uint8)).save(
+                                    os.path.join(sample_path, f"{base_count:05}.{opt.format}"), pnginfo=info
+                                )
+                            seeds += str(opt.seed) + ","
+                            opt.seed += 1
+                            base_count += 1
 
-    time_taken = (toc - tic) / 60.0
+                        if opt.device != "cpu":
+                            mem = torch.cuda.memory_allocated() / 1e6
+                            modelFS.to("cpu")
+                            while torch.cuda.memory_allocated() / 1e6 >= mem:
+                                time.sleep(1)
+                        del samples_ddim
+                        print("memory_final = ", torch.cuda.memory_allocated() / 1e6)
 
-    if not all_lines and opt.infile_loop:
-        os.remove(opt.infile_loop)
-    if opt.infile_loop is None:
-        break
-        
-    print(
-        (
-            "Samples finished in {0:.2f} minutes and exported to "
-            + sample_path
-            + "\n Seeds used = "
-            + seeds[:-1]
-        ).format(time_taken)
-    )
+        toc = time.time()
+
+        time_taken = (toc - tic) / 60.0
+
+        if not all_lines and opt.infile_loop:
+            os.remove(opt.infile_loop)
+        if opt.infile_loop is None:
+            break
+
+        print(
+            (
+                "Samples finished in {0:.2f} minutes and exported to "
+                + sample_path
+                + "\n Seeds used = "
+                + seeds[:-1]
+            ).format(time_taken)
+        )
+    except KeyboardInterrupt:
+        print('**Interrupted** Partial results will be returned.')
