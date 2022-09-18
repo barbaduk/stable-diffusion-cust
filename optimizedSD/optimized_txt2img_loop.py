@@ -297,8 +297,8 @@ config = OmegaConf.load(f"{config}")
 model = instantiate_from_config(config.modelUNet)
 _, _ = model.load_state_dict(sd, strict=False)
 model.eval()
+model.cdevice = opt.device                          
 model.unet_bs = opt.unet_bs
-model.cdevice = opt.device
 model.turbo = opt.turbo
 
 modelCS = instantiate_from_config(config.modelCondStage)
@@ -311,6 +311,10 @@ _, _ = modelFS.load_state_dict(sd, strict=False)
 modelFS.eval()
 del sd
 
+if opt.device != "cpu" and opt.precision == "autocast":
+    modelFS.half()
+    model.half()
+    modelCS.half()
 all_lines = False
 while True:
     try:
@@ -393,6 +397,7 @@ while True:
                     data = list(chunk(sorted(data), batch_size))
 
         if opt_loop.init_img:
+            init_image = init_image.half()
             modelFS.to(opt.device)
 
             init_image = repeat(init_image, "1 ... -> b ...", b=batch_size)
@@ -404,16 +409,9 @@ while True:
                 while torch.cuda.memory_allocated() / 1e6 >= mem:
                     time.sleep(1)
 
-
             assert 0.0 <= opt_loop.strength <= 1.0, "can only work with strength in [0.0, 1.0]"
             t_enc = int(opt_loop.strength * opt.ddim_steps)
-            print(f"target t_enc is {t_enc} steps")     
-        if opt.device != "cpu" and opt.precision == "autocast":
-            model.half()
-            modelCS.half()
-            if opt_loop.init_img:
-                modelFS.half()
-                init_image = init_image.half()
+            print(f"target t_enc is {t_enc} steps")
 
         start_code = None
         if opt.fixed_code:
