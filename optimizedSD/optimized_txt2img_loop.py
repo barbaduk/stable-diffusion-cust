@@ -462,23 +462,27 @@ while True:
                             while torch.cuda.memory_allocated() / 1e6 >= mem:
                                 time.sleep(1)
                         if opt_loop.init_img:
-                            # encode (scaled latent)
-                            z_enc = model.stochastic_encode(
-                                init_latent,
-                                torch.tensor([t_enc] * batch_size).to(opt.device),
-                                opt.seed,
-                                opt.ddim_eta,
-                                opt.ddim_steps,
-                            )
-                            # decode it
-                            samples_ddim = model.sample(
-                                t_enc,
-                                c,
-                                z_enc,
-                                unconditional_guidance_scale=opt.scale,
-                                unconditional_conditioning=uc,
-                                sampler = opt.sampler
-                            )
+                            try:
+                                # encode (scaled latent)
+                                z_enc = model.stochastic_encode(
+                                    init_latent,
+                                    torch.tensor([t_enc] * batch_size).to(opt.device),
+                                    opt.seed,
+                                    opt.ddim_eta,
+                                    opt.ddim_steps,
+                                )
+                                # decode it
+                                samples_ddim = model.sample(
+                                    t_enc,
+                                    c,
+                                    z_enc,
+                                    unconditional_guidance_scale=opt.scale,
+                                    unconditional_conditioning=uc,
+                                    sampler = opt.sampler
+                                )
+                            except KeyboardInterrupt:
+                                print('**Interrupted** Partial results will be returned.')
+                                continue
                         else:
                             try:
                                 samples_ddim = model.sample(
@@ -507,7 +511,7 @@ while True:
                             info = PngImagePlugin.PngInfo()
                             info_text = f""""{prompts[0]}" -s{opt.ddim_steps} -W{opt.W} -H{opt.H} -C{opt.scale} -A{opt.sampler} -S{opt.seed}"""
                             if opt_loop.init_img:
-                                info_text += f' -I"{opt_loop.init_img}"'
+                                info_text += f' -I {opt_loop.init_img} strength:{opt.strength}'
                             if opt.upscale is not None or opt.gfpgan_strength > 0:
                                 if opt.upscale is not None:
                                     info_text += f' -U{opt.upscale[0]}'
